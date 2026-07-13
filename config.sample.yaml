@@ -1,0 +1,59 @@
+# session-divemo configuration SAMPLE.
+#
+# Copy this file to config.yaml and fill in the real values. config.yaml is
+# git-ignored and must NOT be committed (it contains the bot token and the
+# list of users to tag). Only this sample is tracked.
+
+discord:
+  # Bot token (or leave blank and set $DISCORD_BOT_TOKEN in the environment).
+  token: "YOUR_DISCORD_BOT_TOKEN"
+  # The channel the bot posts alerts / status updates into.
+  channel_id: 000000000000000000
+  # Optional: a guild (server) id. If set, slash commands are synced to that
+  # guild for instant availability; otherwise they sync globally (~1h lag).
+  guild_id: 000000000000000000
+
+# How often to poll each source, in seconds (default 3600 = hourly).
+check_interval_seconds: 3600
+
+# Path to the SQLite state database (git-ignored).
+state_db: "divemo.db"
+
+github:
+  # Optional personal access token to raise the GitHub API rate limit.
+  # Unauthenticated (60 req/h) is plenty for hourly polling of 3 repos.
+  token: ""
+
+platforms:
+  android:
+    display_name: "Session Android"
+    github_repo: "session-android"
+    store:
+      store: play
+      app_id: "network.loki.messenger"
+    tag_user_ids:
+      - 111111111111111111
+      - 222222222222222222
+
+  ios:
+    display_name: "Session iOS"
+    github_repo: "session-ios"
+    store:
+      store: appstore
+      bundle_id: "com.loki-project.loki-messenger"
+    tag_user_ids:
+      - 333333333333333333
+
+  desktop:
+    display_name: "Session Desktop"
+    github_repo: "session-desktop"
+    store:
+      store: deb
+      base_url: "https://deb.session.foundation"
+      package: "session-desktop"
+      suite: "sid"
+      component: "main"
+      arch: "amd64"
+    tag_user_ids:
+      - 444444444444444444
+      - 555555555555555555

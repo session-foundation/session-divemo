@@ -1,0 +1,7 @@
+# Minimum versions; these are satisfied by typical system packages.
+# discord.py >= 2.5 is required on Python 3.13+ (the old audioop import was
+# dropped there). Verified working with discord.py 2.6.4 on Python 3.14.
+discord.py>=2.5.2
+requests>=2.32.3
+PyYAML>=6.0
+packaging>=24.0

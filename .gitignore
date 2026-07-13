@@ -1,0 +1,11 @@
+# Local, non-committed config (bot token + users to tag) and state DB.
+config.yaml
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
