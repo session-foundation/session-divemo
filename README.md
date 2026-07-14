@@ -15,20 +15,27 @@ published GitHub release**, and posts to a Discord channel when they diverge.
 For each platform, on every poll it compares the store version `S` with the
 GitHub version `G`:
 
-- **⚠️ Warning** (`S > G`) — the store is **ahead** of GitHub (a public release
-  whose source hasn't been published yet). The configured users for that
-  platform are tagged. Sent once per warning episode.
-- **✅ All-clear** — after a warning, once GitHub catches up (`G >= S`). Only
-  sent if a warning was actually outstanding.
+- **⚠️ Warning** — an out-of-sync divergence. For app stores this means `S > G`
+  (the store is **ahead** of GitHub — a public release whose source hasn't been
+  published). For a **`strict_sync`** platform (the APT repo, which we control
+  and which must always match GitHub) it means `S ≠ G` in **either** direction —
+  behind counts too. The configured users for that platform are tagged.
+- **⚠️ Reminder** — while a warning stays unresolved, it is re-posted (re-tagging)
+  every `warning_reminder_hours` (default 12), and re-sent immediately if the
+  divergence grows.
+- **✅ All-clear** — once `S` and `G` are back in sync. Only sent if a warning
+  was actually outstanding.
 - **ℹ️ GitHub advanced** — GitHub moved forward and is not yet in the store.
+  Informational, no tags. (For a `strict_sync` platform this is a warning, not
+  an info.)
+- **ℹ️ Store advanced** — the store version moved forward without diverging.
   Informational, no tags.
-- **ℹ️ Store advanced** — the store version moved forward (without going ahead
-  of GitHub). Informational, no tags.
 
-If the store is already ahead the first time a platform is seen, the warning
+If a platform is already out of sync the first time it is seen, the warning
 fires immediately; otherwise the first observation just seeds the baseline
-silently. Warning state is latched in SQLite, so warnings fire once and
-all-clears only follow a real warning — even across bot restarts.
+silently. Warning state (and the reminder clock) is latched in SQLite, so
+warnings fire once, reminders are paced, and all-clears only follow a real
+warning — even across bot restarts.
 
 ## Configuration
 
@@ -47,10 +54,16 @@ Key fields (see `config.sample.yaml` for the full, commented example):
 - `discord.channel_id` — channel to post into.
 - `discord.guild_id` — optional; syncs the `/versions` slash command to that
   server instantly (global sync otherwise takes ~1h).
-- `check_interval_seconds` — poll interval (default `3600`).
+- `check_interval_seconds` — poll interval (default `300`). Don't go far below
+  `60`: the Play Store is scraped and GitHub allows 60 unauthenticated req/h.
+- `warning_reminder_hours` — how often to repeat an unresolved warning (default `12`).
+- `github.token` — optional; only needed to poll faster than ~60s. Unauthenticated
+  is fine at the default interval and avoids GitHub org token policies.
 - `state_db` — SQLite path (default `divemo.db`, git-ignored).
 - `platforms.<name>.tag_user_ids` — Discord user IDs to tag in that platform's
   warnings. Lists can differ per platform.
+- `platforms.<name>.strict_sync` — `true` for the APT repo: warn on any GitHub
+  mismatch (behind or ahead), not just when it's ahead. Omit/`false` for stores.
 
 The bot needs permission to send messages (and use application commands) in the
 target channel. No privileged intents are required.

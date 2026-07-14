@@ -3,13 +3,16 @@
 For each configured platform it periodically fetches the latest published
 GitHub release and the latest store release, then:
 
-  * warns (tagging configured users) when the store is *ahead* of GitHub;
-  * sends an all-clear once GitHub catches back up;
+  * warns (tagging configured users) when the store is *ahead* of GitHub — or,
+    for a strict_sync platform (the APT repo we control), whenever the two
+    diverge in *either* direction, since it must always match GitHub;
+  * repeats the warning every warning_reminder_hours while it stays unresolved;
+  * sends an all-clear once they are back in sync;
   * posts an informational update when GitHub advances (not yet in the store);
   * posts an informational update when the store version advances.
 
-State is persisted in SQLite so warnings fire once and all-clears only follow a
-real warning, even across restarts.
+State is persisted in SQLite so warnings fire once, reminders are paced, and
+all-clears only follow a real warning, even across restarts.
 """
 
 import argparse
@@ -17,6 +20,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 
 import discord
 import yaml
@@ -29,6 +33,7 @@ from state import (
     INFO_GITHUB,
     INFO_STORE,
     WARNING,
+    WARNING_REMINDER,
     WARNING_UPDATE,
     StateStore,
     evaluate,
@@ -62,7 +67,8 @@ class VersionMonitorBot(discord.Client):
         self.channel_id = int(config["discord"]["channel_id"])
         self.guild_id = config["discord"].get("guild_id")
         self.github_token = config.get("github", {}).get("token") or None
-        self.interval = int(config.get("check_interval_seconds", 3600))
+        self.interval = int(config.get("check_interval_seconds", 300))
+        self.reminder_interval = float(config.get("warning_reminder_hours", 12)) * 3600
         self.state = StateStore(config.get("state_db", "divemo.db"))
         self._channel = None
 
@@ -91,7 +97,7 @@ class VersionMonitorBot(discord.Client):
 
     # -- monitoring loop -----------------------------------------------------
 
-    @tasks.loop(seconds=3600)
+    @tasks.loop(seconds=300)
     async def check_versions(self):
         for name, pcfg in self.platforms.items():
             try:
@@ -113,10 +119,18 @@ class VersionMonitorBot(discord.Client):
         )
 
         prev = self.state.get(name)
-        result = evaluate(prev, github.version, store.version, compare_versions)
+        result = evaluate(
+            prev, github.version, store.version, compare_versions,
+            strict_sync=bool(pcfg.get("strict_sync", False)),
+            now=time.time(),
+            reminder_interval=self.reminder_interval,
+        )
         for event in result.events:
             await self._announce(name, pcfg, event, github, store)
-        self.state.upsert(name, github.version, store.version, result.warning_active)
+        self.state.upsert(
+            name, github.version, store.version,
+            result.warning_active, result.last_warned_at,
+        )
 
     # -- messaging -----------------------------------------------------------
 
@@ -135,33 +149,44 @@ class VersionMonitorBot(discord.Client):
         if github.url:
             embed.add_field(name="GitHub release", value=github.url, inline=False)
 
-        if event.kind in (WARNING, WARNING_UPDATE):
+        if event.kind in (WARNING, WARNING_UPDATE, WARNING_REMINDER):
             embed.color = COLOR_WARNING
-            mentions = " ".join(f"<@{uid}>" for uid in pcfg.get("tag_user_ids", []))
-            allowed = discord.AllowedMentions(
-                users=[discord.Object(id=int(uid)) for uid in pcfg.get("tag_user_ids", [])]
-            )
-            if event.kind == WARNING:
-                seen = " (first check)" if event.initial else ""
-                embed.title = f"⚠️ {display}: {store_name} is ahead of GitHub{seen}"
-                embed.description = (
-                    f"The {store_name} has published **{event.store_version}**, "
-                    f"but the latest GitHub release is only **{event.github_version}**."
+            ids = [int(uid) for uid in pcfg.get("tag_user_ids", [])]
+            content = " ".join(f"<@{uid}>" for uid in ids)
+            allowed = discord.AllowedMentions(users=[discord.Object(id=uid) for uid in ids])
+
+            # Direction-aware: the store may be ahead of GitHub or (for the APT
+            # repo, which must stay in sync) behind it.
+            if compare_versions(event.store_version, event.github_version) > 0:
+                direction = f"{store_name} is ahead of GitHub"
+                gap = (
+                    f"The {store_name} has published **{event.store_version}**, but the "
+                    f"latest GitHub release is only **{event.github_version}**."
                 )
             else:
-                embed.title = f"⚠️ {display}: {store_name} advanced further ahead of GitHub"
-                embed.description = (
-                    f"The {store_name} moved on to **{event.store_version}** while "
-                    f"GitHub is still at **{event.github_version}**."
+                direction = f"{store_name} is behind GitHub"
+                gap = (
+                    f"GitHub has published **{event.github_version}**, but the "
+                    f"{store_name} is still at **{event.store_version}**."
                 )
-            content = mentions
+
+            if event.kind == WARNING:
+                first = " (first check)" if event.initial else ""
+                embed.title = f"⚠️ {display}: {direction}{first}"
+                embed.description = gap
+            elif event.kind == WARNING_UPDATE:
+                embed.title = f"⚠️ {display}: {direction} — divergence grew"
+                embed.description = gap
+            else:  # WARNING_REMINDER
+                hours = int(self.reminder_interval // 3600)
+                embed.title = f"⚠️ {display}: {direction} — still unresolved"
+                embed.description = f"{gap}\nStill out of sync after ~{hours}h."
 
         elif event.kind == ALL_CLEAR:
             embed.color = COLOR_ALL_CLEAR
-            embed.title = f"✅ {display}: resolved — GitHub caught up"
+            embed.title = f"✅ {display}: resolved — back in sync"
             embed.description = (
-                f"GitHub is now at **{event.github_version}**, no longer behind the "
-                f"{store_name} (**{event.store_version}**)."
+                f"{store_name} and GitHub are back in sync at **{event.github_version}**."
             )
 
         elif event.kind == INFO_GITHUB:
@@ -184,6 +209,10 @@ class VersionMonitorBot(discord.Client):
             return
 
         await channel.send(content=content, embed=embed, allowed_mentions=allowed)
+        log.info(
+            "Posted %s for %s (store=%s github=%s)",
+            event.kind, name, event.store_version, event.github_version,
+        )
 
     # -- slash command -------------------------------------------------------
 
@@ -251,6 +280,7 @@ def _run_check_once(config):
     """Offline dry-run: fetch and evaluate every platform, print the events."""
     store = StateStore(config.get("state_db", "divemo.db"))
     github_token = config.get("github", {}).get("token") or None
+    reminder_interval = float(config.get("warning_reminder_hours", 12)) * 3600
     for name, pcfg in config["platforms"].items():
         try:
             github = fetch_github_latest(pcfg["github_repo"], github_token)
@@ -259,13 +289,21 @@ def _run_check_once(config):
             print(f"{name}: ERROR {exc}")
             continue
         prev = store.get(name)
-        result = evaluate(prev, github.version, store_info.version, compare_versions)
+        result = evaluate(
+            prev, github.version, store_info.version, compare_versions,
+            strict_sync=bool(pcfg.get("strict_sync", False)),
+            now=time.time(),
+            reminder_interval=reminder_interval,
+        )
         events = ", ".join(e.kind for e in result.events) or "none"
         print(
             f"{name}: github={github.version} store={store_info.version} "
             f"warning_active={result.warning_active} events=[{events}]"
         )
-        store.upsert(name, github.version, store_info.version, result.warning_active)
+        store.upsert(
+            name, github.version, store_info.version,
+            result.warning_active, result.last_warned_at,
+        )
     store.close()
 
 

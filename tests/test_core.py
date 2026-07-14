@@ -16,6 +16,7 @@ from state import (  # noqa: E402
     INFO_GITHUB,
     INFO_STORE,
     WARNING,
+    WARNING_REMINDER,
     WARNING_UPDATE,
     PlatformState,
     StateStore,
@@ -30,8 +31,9 @@ def kinds(result):
     return [e.kind for e in result.events]
 
 
-def synced(github, store, warning=False):
-    return PlatformState(github, store, warning_active=warning, initialized=True)
+def synced(github, store, warning=False, last_warned=None):
+    return PlatformState(github, store, warning_active=warning, initialized=True,
+                         last_warned_at=last_warned)
 
 
 class VersionUtilsTest(unittest.TestCase):
@@ -187,6 +189,79 @@ class StateStoreIntegrationTest(unittest.TestCase):
                 self.assertEqual(self._step(store, "ios", "1.0.0", "1.1.0"), [])
             finally:
                 store.close()
+
+
+class StrictSyncTest(unittest.TestCase):
+    """The APT repo (strict_sync) must match GitHub in BOTH directions."""
+
+    def test_behind_warns_under_strict_sync(self):
+        # GitHub ahead of the repo: normally informational, but strict_sync warns.
+        result = evaluate(synced("1.0.0", "1.0.0"), "1.1.0", "1.0.0", CMP,
+                          strict_sync=True)
+        self.assertEqual(kinds(result), [WARNING])
+        self.assertTrue(result.warning_active)
+
+    def test_behind_is_only_info_without_strict_sync(self):
+        result = evaluate(synced("1.0.0", "1.0.0"), "1.1.0", "1.0.0", CMP,
+                          strict_sync=False)
+        self.assertEqual(kinds(result), [INFO_GITHUB])
+        self.assertFalse(result.warning_active)
+
+    def test_ahead_warns_under_strict_sync(self):
+        result = evaluate(synced("1.0.0", "1.0.0"), "1.0.0", "1.1.0", CMP,
+                          strict_sync=True)
+        self.assertEqual(kinds(result), [WARNING])
+
+    def test_behind_resolves_when_repo_catches_up(self):
+        prev = synced("1.1.0", "1.0.0", warning=True, last_warned=100.0)
+        result = evaluate(prev, "1.1.0", "1.1.0", CMP, strict_sync=True)
+        self.assertEqual(kinds(result), [ALL_CLEAR])
+        self.assertFalse(result.warning_active)
+        self.assertIsNone(result.last_warned_at)
+
+    def test_behind_divergence_grows(self):
+        # Repo still behind and GitHub pulls further ahead -> re-tag.
+        prev = synced("1.1.0", "1.0.0", warning=True, last_warned=100.0)
+        result = evaluate(prev, "1.2.0", "1.0.0", CMP, strict_sync=True)
+        self.assertEqual(kinds(result), [WARNING_UPDATE])
+        self.assertTrue(result.warning_active)
+
+    def test_seed_behind_warns_under_strict_sync(self):
+        result = evaluate(None, "1.1.0", "1.0.0", CMP, strict_sync=True, now=50.0)
+        self.assertEqual(kinds(result), [WARNING])
+        self.assertTrue(result.warning_active)
+        self.assertEqual(result.last_warned_at, 50.0)
+
+
+class ReminderTest(unittest.TestCase):
+    INTERVAL = 12 * 3600
+
+    def test_reminder_fires_after_interval(self):
+        prev = synced("1.0.0", "1.1.0", warning=True, last_warned=0.0)
+        result = evaluate(prev, "1.0.0", "1.1.0", CMP,
+                          now=self.INTERVAL, reminder_interval=self.INTERVAL)
+        self.assertEqual(kinds(result), [WARNING_REMINDER])
+        self.assertTrue(result.warning_active)
+        self.assertEqual(result.last_warned_at, self.INTERVAL)  # timer reset
+
+    def test_no_reminder_before_interval(self):
+        prev = synced("1.0.0", "1.1.0", warning=True, last_warned=0.0)
+        result = evaluate(prev, "1.0.0", "1.1.0", CMP,
+                          now=self.INTERVAL - 1, reminder_interval=self.INTERVAL)
+        self.assertEqual(kinds(result), [])
+        self.assertEqual(result.last_warned_at, 0.0)  # timer untouched
+
+    def test_worsening_resets_reminder_timer(self):
+        prev = synced("1.0.0", "1.1.0", warning=True, last_warned=0.0)
+        result = evaluate(prev, "1.0.0", "1.2.0", CMP,
+                          now=5000.0, reminder_interval=self.INTERVAL)
+        self.assertEqual(kinds(result), [WARNING_UPDATE])
+        self.assertEqual(result.last_warned_at, 5000.0)
+
+    def test_no_reminder_when_interval_unset(self):
+        prev = synced("1.0.0", "1.1.0", warning=True, last_warned=0.0)
+        result = evaluate(prev, "1.0.0", "1.1.0", CMP, now=self.INTERVAL * 10)
+        self.assertEqual(kinds(result), [])
 
 
 if __name__ == "__main__":
