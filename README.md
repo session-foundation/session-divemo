@@ -102,19 +102,43 @@ platform currently in a warning state with ⚠️.
 
 ## Running as a service (systemd)
 
-`divemo.service` is a ready-to-adapt **systemd user service** template (autostart
-on boot, restart on failure, logs to journald). Adjust the paths if you don't
-clone to `~/session-divemo`, then:
+`divemo.service` is a hardened **system service** template — it runs as a
+dedicated unprivileged `divemo` user, autostarts on boot, restarts on failure,
+and logs to journald (so it's visible to all admins via `systemctl`). Suggested
+FHS layout:
+
+| Path | Purpose |
+| --- | --- |
+| `/opt/session-divemo` | the code (this repo) |
+| `/etc/divemo/config.yaml` | config, mode `640` `root:divemo` (holds the token) |
+| `/var/lib/divemo/` | SQLite state (auto-created via `StateDirectory=`) |
 
 ```sh
-mkdir -p ~/.config/systemd/user
-cp divemo.service ~/.config/systemd/user/divemo.service
-systemctl --user daemon-reload
-systemctl --user enable --now divemo.service
-sudo loginctl enable-linger "$USER"   # keep it running while logged out
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin divemo
+sudo git clone git@github.com:session-foundation/session-divemo.git /opt/session-divemo
+sudo pip install -r /opt/session-divemo/requirements.txt   # or system packages
+
+# config in /etc, readable only by root + the divemo user
+sudo install -d -m 750 -o root -g divemo /etc/divemo
+sudo install -m 640 -o root -g divemo /opt/session-divemo/config.sample.yaml /etc/divemo/config.yaml
+sudoedit /etc/divemo/config.yaml    # fill in token/channel/guild/tags;
+                                    # set state_db: "/var/lib/divemo/divemo.db"
+
+sudo cp /opt/session-divemo/divemo.service /etc/systemd/system/divemo.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now divemo.service
 ```
 
-Follow the logs with `journalctl --user -u divemo -f`.
+Status and logs:
+
+```sh
+systemctl status divemo
+journalctl -u divemo -f
+```
+
+Because the unit sets `ProtectSystem=strict`, the code and config are mounted
+read-only; only `/var/lib/divemo` is writable, so `state_db` **must** point
+there (`/var/lib/divemo/divemo.db`).
 
 ## Tests
 

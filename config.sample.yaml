@@ -22,7 +22,8 @@ check_interval_seconds: 300
 # How often (hours) to repeat an unresolved warning until it clears. Default 12.
 warning_reminder_hours: 12
 
-# Path to the SQLite state database (git-ignored).
+# Path to the SQLite state database (git-ignored). For the systemd system
+# service, point this at the StateDirectory: "/var/lib/divemo/divemo.db".
 state_db: "divemo.db"
 
 github:
