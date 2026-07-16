@@ -10,7 +10,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sources import _packages_version  # noqa: E402
+from sources import _fdroid_version, _packages_version  # noqa: E402
 from state import (  # noqa: E402
     ALL_CLEAR,
     INFO_GITHUB,
@@ -137,6 +137,40 @@ class PackagesParseTest(unittest.TestCase):
 
     def test_missing_package(self):
         self.assertIsNone(_packages_version(self.SAMPLE, "nope"))
+
+
+class FdroidParseTest(unittest.TestCase):
+    # An F-Droid index-v1.json maps each app id to a list of per-build entries
+    # (one per ABI split); the live build is the highest integer versionCode.
+    SAMPLE = {
+        "packages": {
+            "network.loki.messenger": [
+                {"versionName": "1.33.4", "versionCode": 4519},
+                {"versionName": "1.33.5", "versionCode": 4521},  # arm64
+                {"versionName": "1.33.5", "versionCode": 4525},  # universal
+                {"versionName": "1.33.5", "versionCode": 4522},  # armeabi
+            ],
+            "other.app": [{"versionName": "9.9.9", "versionCode": 1}],
+        }
+    }
+
+    def test_highest_version_code_wins(self):
+        self.assertEqual(
+            _fdroid_version(self.SAMPLE, "network.loki.messenger"), "1.33.5"
+        )
+
+    def test_not_lexical_or_list_order(self):
+        # 4525 (universal, listed 3rd) must win over the 4521 entry listed first.
+        index = {"packages": {"app": [
+            {"versionName": "2.0.0", "versionCode": 100},
+            {"versionName": "10.0.0", "versionCode": 200},
+        ]}}
+        self.assertEqual(_fdroid_version(index, "app"), "10.0.0")
+
+    def test_missing_app(self):
+        self.assertIsNone(_fdroid_version(self.SAMPLE, "nope"))
+        self.assertIsNone(_fdroid_version({"packages": {}}, "network.loki.messenger"))
+        self.assertIsNone(_fdroid_version({}, "network.loki.messenger"))
 
 
 class StateStoreIntegrationTest(unittest.TestCase):

@@ -43,6 +43,37 @@ platforms:
       - 111111111111111111
       - 222222222222222222
 
+  # Session Android is also published to our F-Droid repo (session-fdroid). The
+  # release process auto-opens a "Release X.Y.Z" PR there that must be merged
+  # right after the GitHub release. Two checks track this, both against the
+  # session-android GitHub release:
+  android_fdroid_merged:
+    display_name: "Session Android (F-Droid, merged)"
+    github_repo: "session-android"
+    # Our repo: the merged release PR must EXACTLY match GitHub, so warn on ANY
+    # divergence (behind = the release PR wasn't merged). Same as desktop's APT.
+    strict_sync: true
+    store:
+      store: fdroid
+      # The index committed to session-fdroid's default branch == the merged
+      # state (its default branch is "master", not "main").
+      base_url: "https://raw.githubusercontent.com/session-foundation/session-fdroid/master/fdroid/repo"
+      app_id: "network.loki.messenger"
+    tag_user_ids:
+      - 111111111111111111
+
+  android_fdroid_live:
+    display_name: "Session Android (F-Droid, live)"
+    github_repo: "session-android"
+    # The version F-Droid users actually pick up. App-store semantics (no
+    # strict_sync): being behind is normal deploy/propagation lag -> info only.
+    store:
+      store: fdroid
+      base_url: "https://fdroid.getsession.org/fdroid/repo"
+      app_id: "network.loki.messenger"
+    tag_user_ids:
+      - 111111111111111111
+
   ios:
     display_name: "Session iOS"
     github_repo: "session-ios"

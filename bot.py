@@ -99,9 +99,13 @@ class VersionMonitorBot(discord.Client):
 
     @tasks.loop(seconds=300)
     async def check_versions(self):
+        # Cache GitHub results per cycle so a repo shared by several platforms
+        # (e.g. session-android backs both the Play and F-Droid checks) is only
+        # fetched once, keeping us under the unauthenticated 60 req/h limit.
+        github_cache = {}
         for name, pcfg in self.platforms.items():
             try:
-                await self._check_platform(name, pcfg)
+                await self._check_platform(name, pcfg, github_cache)
             except Exception:  # keep the loop alive across per-platform errors
                 log.exception("Version check failed for platform %s", name)
 
@@ -109,10 +113,14 @@ class VersionMonitorBot(discord.Client):
     async def _before_loop(self):
         await self.wait_until_ready()
 
-    async def _check_platform(self, name, pcfg):
-        github = await asyncio.to_thread(
-            fetch_github_latest, pcfg["github_repo"], self.github_token
-        )
+    async def _check_platform(self, name, pcfg, github_cache):
+        repo = pcfg["github_repo"]
+        github = github_cache.get(repo)
+        if github is None:
+            github = await asyncio.to_thread(
+                fetch_github_latest, repo, self.github_token
+            )
+            github_cache[repo] = github
         store = await asyncio.to_thread(fetch_store, pcfg["store"])
         log.info(
             "%s: github=%s store=%s", name, github.version, store.version
@@ -281,9 +289,13 @@ def _run_check_once(config):
     store = StateStore(config.get("state_db", "divemo.db"))
     github_token = config.get("github", {}).get("token") or None
     reminder_interval = float(config.get("warning_reminder_hours", 12)) * 3600
+    github_cache = {}  # fetch each GitHub repo once even if shared by platforms
     for name, pcfg in config["platforms"].items():
         try:
-            github = fetch_github_latest(pcfg["github_repo"], github_token)
+            repo = pcfg["github_repo"]
+            if repo not in github_cache:
+                github_cache[repo] = fetch_github_latest(repo, github_token)
+            github = github_cache[repo]
             store_info = fetch_store(pcfg["store"])
         except Exception as exc:  # noqa: BLE001 - report and continue
             print(f"{name}: ERROR {exc}")

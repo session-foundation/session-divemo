@@ -8,9 +8,11 @@ Channels:
   * App Store -- the iTunes lookup API (official, returns the live version)
   * Play Store-- scraped from the store listing page (no official API exists)
   * Debian    -- parsed from the apt repository's Packages index
+  * F-Droid   -- parsed from an F-Droid repo's index-v1.json (merged or live)
 """
 
 import gzip
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -131,6 +133,43 @@ def _packages_version(packages_text, package):
     return None
 
 
+def fetch_fdroid(base_url, app_id, timeout=30):
+    """Latest version of an app published in an F-Droid repository.
+
+    Reads the repo's ``index-v1.json``; the same fetcher serves both the
+    *merged* index committed to session-fdroid's ``main`` branch (via
+    raw.githubusercontent.com) and the *live* index served to F-Droid clients
+    at fdroid.getsession.org -- they differ only by ``base_url``.
+    """
+    base = base_url.rstrip("/")
+    index_url = f"{base}/index-v1.json"
+    resp = requests.get(index_url, headers={"User-Agent": _USER_AGENT}, timeout=timeout)
+    resp.raise_for_status()
+    try:
+        index = resp.json()
+    except json.JSONDecodeError as exc:
+        raise SourceError(f"could not parse F-Droid index at {index_url}: {exc}") from exc
+
+    version = _fdroid_version(index, app_id)
+    if version is None:
+        raise SourceError(f"app {app_id!r} not found in {index_url}")
+    return VersionInfo(normalize_version(version), base)
+
+
+def _fdroid_version(index, app_id):
+    """Return the ``versionName`` of the newest build of ``app_id``, or None.
+
+    ``index`` is the parsed ``index-v1.json``. Each app maps to a list of
+    per-build entries (one per ABI split); the newest is the one with the
+    highest integer ``versionCode``.
+    """
+    builds = (index.get("packages") or {}).get(app_id)
+    if not builds:
+        return None
+    newest = max(builds, key=lambda b: b.get("versionCode", 0))
+    return newest.get("versionName")
+
+
 # Dispatch table so the bot can resolve a store version from platform config
 # keyed by its "store" discriminator.
 def fetch_store(store_config):
@@ -154,6 +193,8 @@ def fetch_store(store_config):
             store_config.get("component", "main"),
             store_config.get("arch", "amd64"),
         )
+    if store_type == "fdroid":
+        return fetch_fdroid(store_config["base_url"], store_config["app_id"])
     raise SourceError(f"unknown store type: {store_type!r}")
 
 
@@ -161,4 +202,5 @@ STORE_DISPLAY_NAMES = {
     "appstore": "App Store",
     "play": "Play Store",
     "deb": "APT repo",
+    "fdroid": "F-Droid repo",
 }
