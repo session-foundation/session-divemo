@@ -5,13 +5,27 @@
 # list of users to tag). Only this sample is tracked.
 
 discord:
-  # Bot token (or leave blank and set $DISCORD_BOT_TOKEN in the environment).
+  # Alerts go to every target configured here: at most one bot plus any number
+  # of webhooks (at least one target overall).
+
+  # --- bot (optional) ---
+  # A bot user installed in a server: posts alerts and serves the /versions
+  # slash command. Installing it needs Manage Server. Enabled when a token is
+  # set; leave blank (and $DISCORD_BOT_TOKEN unset) to run webhooks only.
   token: "YOUR_DISCORD_BOT_TOKEN"
   # The channel the bot posts alerts / status updates into.
   channel_id: 000000000000000000
   # Optional: a guild (server) id. If set, slash commands are synced to that
   # guild for instant availability; otherwise they sync globally (~1h lag).
   guild_id: 000000000000000000
+
+  # --- webhooks (optional) ---
+  # Alerts only (no /versions). Creating one only needs Manage Webhooks on the
+  # channel: Edit Channel -> Integrations -> Webhooks -> Copy Webhook URL.
+  # Anyone holding a URL can post to its channel, so keep these as secret as
+  # the bot token. Alerts appear under the name/avatar set on the webhook.
+  webhook_urls: []
+  #  - "https://discord.com/api/webhooks/000000000000000000/XXXXXXXX..."
 
 # How often to poll each source, in seconds (default 300 = every 5 min). Don't
 # go much below 60s: the Play Store is scraped (no API) and may soft-block, and

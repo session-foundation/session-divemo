@@ -50,10 +50,14 @@ $EDITOR config.yaml
 
 Key fields (see `config.sample.yaml` for the full, commented example):
 
-- `discord.token` — bot token (or set `$DISCORD_BOT_TOKEN` instead).
-- `discord.channel_id` — channel to post into.
-- `discord.guild_id` — optional; syncs the `/versions` slash command to that
-  server instantly (global sync otherwise takes ~1h).
+- Bot (optional; see [Bot and webhooks](#bot-and-webhooks)):
+  - `discord.token` — bot token (or set `$DISCORD_BOT_TOKEN` instead). The bot
+    runs only when a token is set.
+  - `discord.channel_id` — channel to post into (required with a token).
+  - `discord.guild_id` — optional; syncs the `/versions` slash command to that
+    server instantly (global sync otherwise takes ~1h).
+- `discord.webhook_urls` — optional list of channel webhook URLs to post to as
+  well. Treat them as secrets: anyone with one can post to its channel.
 - `check_interval_seconds` — poll interval (default `300`). Don't go far below
   `60`: the Play Store is scraped and GitHub allows 60 unauthenticated req/h.
 - `warning_reminder_hours` — how often to repeat an unresolved warning (default `12`).
@@ -65,8 +69,25 @@ Key fields (see `config.sample.yaml` for the full, commented example):
 - `platforms.<name>.strict_sync` — `true` for the APT repo: warn on any GitHub
   mismatch (behind or ahead), not just when it's ahead. Omit/`false` for stores.
 
-The bot needs permission to send messages (and use application commands) in the
-target channel. No privileged intents are required.
+### Bot and webhooks
+
+Every alert is posted to all configured targets: at most one bot plus any
+number of webhooks, in any servers. At least one target is required.
+
+- **Bot** — a bot user installed in a server, invited with the `bot` and
+  `applications.commands` scopes. Posts alerts and serves `/versions`.
+  Installing it requires **Manage Server**; it then needs **View Channel**,
+  **Send Messages** and **Embed Links** on the target channel (for a private
+  channel, add the bot to it). No privileged intents are required.
+- **Webhooks** — post the same alerts (embeds and user tags) through a channel
+  webhook, with no bot user. There is no `/versions`, since a webhook can't
+  receive commands. Creating a webhook only needs **Manage Webhooks** on that
+  one channel, so it works where you can't get a bot installed. Without a bot,
+  no gateway connection is made at all.
+
+A target that fails (e.g. a webhook someone deleted) is logged and doesn't
+affect the others; that target simply misses the alert. Only if *every* target
+fails is the alert retried on the next poll.
 
 ## Running
 
@@ -95,7 +116,7 @@ python3 bot.py -c config.yaml --check-once
 
 ### Slash command
 
-`/versions` posts (visibly, so it can be referenced in the conversation) the
+Bot only. `/versions` posts (visibly, so it can be referenced in the conversation) the
 latest-seen versions per platform, labelled with each platform's real source —
 **Play Store** / **App Store** / **APT repo** vs **GitHub** — and flags any
 platform currently in a warning state with ⚠️.
@@ -142,7 +163,8 @@ there (`/var/lib/divemo/divemo.db`).
 
 ## Tests
 
-Pure comparison/transition logic and the SQLite round-trip are unit tested:
+Pure comparison/transition logic, the SQLite round-trip, and the monitor's
+polling/alerting (against a fake transport) are tested:
 
 ```sh
 python3 -m unittest discover tests
@@ -152,7 +174,8 @@ python3 -m unittest discover tests
 
 | File                 | Purpose                                                     |
 | -------------------- | ----------------------------------------------------------- |
-| `bot.py`             | Discord bot, poll loop, message formatting, CLI entry point |
+| `bot.py`             | CLI entry point; the bot (+ `/versions`) and webhooks       |
+| `monitor.py`         | Poll loop and alert formatting, independent of transport    |
 | `sources.py`         | Version fetchers (GitHub, App Store, Play, deb repo)        |
 | `state.py`           | SQLite state store + the pure transition state machine      |
 | `version_utils.py`   | Version normalization and comparison                        |

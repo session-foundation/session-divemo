@@ -1,13 +1,15 @@
 # session-divemo — project guide
 
-**di**scord **ve**rsion **mo**nitor. A long-running Discord **gateway bot** that,
-for each Session platform, compares the latest *published store release* against
-the latest *GitHub release* and posts to a Discord channel when they diverge
-(warning + user tags), repeats the warning until resolved, and posts an
-all-clear once back in sync. Plus a `/versions` slash command.
+**di**scord **ve**rsion **mo**nitor. A long-running Discord daemon that, for each
+Session platform, compares the latest *published store release* against the
+latest *GitHub release* and posts to Discord when they diverge (warning + user
+tags), repeats the warning until resolved, and posts an all-clear once back in
+sync. Alerts go to **0 or 1 gateway bot** (which also serves a `/versions` slash
+command) **plus any number of channel webhooks** (alerts only), at least one
+target overall.
 
 - Remote: `git@github.com:session-foundation/session-divemo.git`, default branch `main`.
-- Language: Python 3, `discord.py` (gateway). No web server; a single daemon.
+- Language: Python 3, `discord.py` (gateway bot and/or webhooks). No web server; a single daemon.
 - Built entirely in one prior session (originally scaffolded under a different
   repo, `session-shared-scripts`, then moved here — this is the real home).
 
@@ -15,15 +17,17 @@ all-clear once back in sync. Plus a `/versions` slash command.
 
 | File | Purpose |
 | --- | --- |
-| `bot.py` | Discord `Client` + `CommandTree`, poll loop (`tasks.loop`), message/embed formatting, `/versions`, CLI (`--check-once`), config loader |
+| `bot.py` | CLI (`--check-once`), config loader, target setup: the optional `Client` + `CommandTree` bot (`/versions`) and webhooks |
+| `monitor.py` | Transport-agnostic `Monitor`: poll loop, message/embed formatting, fan-out delivery to all targets |
 | `sources.py` | Version fetchers: GitHub, App Store, Play, deb repo, F-Droid; `STORE_DISPLAY_NAMES`; `fetch_store` dispatch |
 | `state.py` | SQLite `StateStore` + the **pure** transition state machine `evaluate()` (all decision logic; no IO) |
 | `version_utils.py` | Version normalize + compare (uses `packaging.version`) |
 | `config.sample.yaml` | Committed template. Real config is `config.yaml` (git-ignored) |
 | `divemo.service` | Hardened systemd **system**-service template (generic `/opt` + dedicated user) |
 | `tests/test_core.py` | 36 unit/integration tests (pure logic + SQLite round-trip) |
+| `tests/test_monitor.py` | 6 `Monitor` tests with mocked fetchers and fake targets (tagging, fan-out, failure handling, GitHub memo, dry run) |
 
-`bot.py`/`sources.py`/`state.py`/`version_utils.py` import each other flat (repo
+The top-level modules import each other flat (repo
 root is on `sys.path`), so run from the repo dir.
 
 ## Version sources (exact identifiers)
@@ -51,7 +55,7 @@ root is on `sys.path`), so run from the repo dir.
 - **GitHub**: `api.github.com/repos/session-foundation/session-{android,ios,desktop}/releases/latest`.
   Tag prefixes differ (desktop is `v1.18.1`; android/ios have no `v`); `normalize_version` strips a leading `v`.
   `session-android` backs three platforms (Play + both F-Droid checks) but is
-  fetched **once per cycle** — `check_versions` memoizes GitHub results by repo.
+  fetched **once per cycle** — `Monitor.check_all` memoizes GitHub results by repo.
 
 ## Alert semantics (state machine in `state.py:evaluate`)
 
@@ -78,7 +82,10 @@ Store / APT repo / F-Droid repo).
 Copy `config.sample.yaml` → `config.yaml` (git-ignored; holds the bot token and
 per-platform tag user IDs). Key fields:
 
-- `discord.token` (or `$DISCORD_BOT_TOKEN`), `discord.channel_id`, `discord.guild_id`.
+- Bot (optional; enabled iff a token is set): `discord.token` (or
+  `$DISCORD_BOT_TOKEN`), `discord.channel_id` (required with a token),
+  `discord.guild_id`.
+- `discord.webhook_urls` — optional list of channel webhook URLs (secrets).
 - `check_interval_seconds` (default **300**). Don't go far below 60 (Play scrape + GitHub 60/h unauth).
 - `warning_reminder_hours` (default 12).
 - `github.token` — **intentionally blank**; see "no GitHub token" below.
@@ -92,14 +99,16 @@ Discord app is **"Session Release Monitor"** (app id `1526269506488504471`). The
 bot needs **View Channel + Send Messages + Embed Links** *on the target channel*
 (private channels override the server-wide grant — add the bot to the channel).
 Slash commands come from the `applications.commands` scope, not a permission bit.
-Channel/guild/tag IDs live in `config.yaml`.
+Installing the bot needs **Manage Server**; a webhook only needs **Manage
+Webhooks** on its channel, which is why webhooks exist (servers where we can't
+get the bot installed). Channel/guild/tag IDs and webhook URLs live in `config.yaml`.
 
 ## Running & tests
 
 ```sh
 python3 bot.py -c config.yaml               # run the bot
 python3 bot.py -c config.yaml --check-once  # dry run: fetch+evaluate+print, no Discord
-python3 -m unittest discover tests          # 36 tests
+python3 -m unittest discover tests          # 42 tests
 ```
 
 ## Deployment (host: angus)
@@ -127,7 +136,7 @@ Logs: `journalctl -u divemo -f`.
   across the 3 distinct repos). A fine-grained PAT was tried but the
   `session-foundation` org **rejects fine-grained tokens with lifetime > 366 days**
   (403 with a policy message) — so we run unauthenticated. Only add a token if
-  polling < ~60s. Note: the per-cycle GitHub memo in `check_versions` is what
+  polling < ~60s. Note: the per-cycle GitHub memo in `Monitor.check_all` is what
   keeps this at 3 repos — without it the two extra `session-android` platforms
   (F-Droid) would push us to 60/h, right at the ceiling.
 - **`discord.py` / Python:** `< 2.5` works on Python ≤ 3.12; **≥ 2.5 required on
@@ -145,6 +154,16 @@ Logs: `journalctl -u divemo -f`.
   `strict_sync` platforms keep exact behavior.
 - **`/versions` works without channel perms** (interaction responses bypass them);
   proactive `channel.send` alerts do **not** — hence the channel-permission need.
+- **Multi-target delivery is best-effort per target.** `Monitor._deliver` posts
+  to all targets concurrently; failures are logged, and the event only counts
+  as undelivered (state not advanced → retried next poll) when **every** target
+  failed. So a dead webhook in one server never blocks or duplicates alerts
+  elsewhere — it just misses them. Unreachable webhooks at startup are logged,
+  not fatal. Never log a webhook URL (its token is the posting secret); targets
+  are labelled by webhook id.
+- **The bot owns the `Monitor`** when present (`VersionMonitorBot` starts
+  polling after `wait_until_ready`, so its channel is resolvable); webhook-only
+  runs the `Monitor` directly with no gateway connection.
 - **Bot base class is `discord.Client` + `CommandTree`**, deliberately not
   `commands.Bot` (which warns about the privileged message-content intent we
   don't use). No privileged intents required.

@@ -1,18 +1,15 @@
-"""Discord bot that watches Session store releases vs. GitHub releases.
+"""session-divemo entry point: runs the release monitor against Discord.
 
-For each configured platform it periodically fetches the latest published
-GitHub release and the latest store release, then:
+Alerts are posted to every configured target, any mix of:
 
-  * warns (tagging configured users) when the store is *ahead* of GitHub — or,
-    for a strict_sync platform (the APT repo we control), whenever the two
-    diverge in *either* direction, since it must always match GitHub;
-  * repeats the warning every warning_reminder_hours while it stays unresolved;
-  * sends an all-clear once they are back in sync;
-  * posts an informational update when GitHub advances (not yet in the store);
-  * posts an informational update when the store version advances.
+  * at most one gateway bot (enabled by configuring a token), installed in a
+    server: posts alerts to ``channel_id`` and serves the ``/versions`` slash
+    command. Adding it to a server requires Manage Server there.
+  * any number of channel webhooks (``webhook_urls``): alerts only, since a
+    webhook can't receive commands. Creating one only needs Manage Webhooks on
+    that channel.
 
-State is persisted in SQLite so warnings fire once, reminders are paced, and
-all-clears only follow a real warning, even across restarts.
+See ``monitor.py`` for what gets posted and when.
 """
 
 import argparse
@@ -20,31 +17,16 @@ import asyncio
 import logging
 import os
 import sys
-import time
 
+import aiohttp
 import discord
 import yaml
 from discord import app_commands
-from discord.ext import tasks
 
-from sources import STORE_DISPLAY_NAMES, fetch_github_latest, fetch_store
-from state import (
-    ALL_CLEAR,
-    INFO_GITHUB,
-    INFO_STORE,
-    WARNING,
-    WARNING_REMINDER,
-    WARNING_UPDATE,
-    StateStore,
-    evaluate,
-)
-from version_utils import compare_versions
+from monitor import Monitor
+from sources import STORE_DISPLAY_NAMES
 
 log = logging.getLogger("divemo")
-
-COLOR_WARNING = 0xE74C3C
-COLOR_ALL_CLEAR = 0x2ECC71
-COLOR_INFO = 0x3498DB
 
 
 def load_config(path):
@@ -56,27 +38,30 @@ def load_config(path):
 
 
 class VersionMonitorBot(discord.Client):
+    """The gateway bot: owns the monitor so polling starts once it is ready.
+
+    ``webhooks`` are the other targets the monitor posts to alongside the
+    bot's own channel.
+    """
+
     # Only slash commands and message-posting are used, so a plain Client with a
     # CommandTree is sufficient (and avoids the message-content intent that
     # commands.Bot's prefix handling would warn about).
-    def __init__(self, config):
+    def __init__(self, config, webhooks):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
-        self.config = config
-        self.platforms = config["platforms"]
         self.channel_id = int(config["discord"]["channel_id"])
         self.guild_id = config["discord"].get("guild_id")
-        self.github_token = config.get("github", {}).get("token") or None
-        self.interval = int(config.get("check_interval_seconds", 300))
-        self.reminder_interval = float(config.get("warning_reminder_hours", 12)) * 3600
-        self.state = StateStore(config.get("state_db", "divemo.db"))
+        self.monitor = Monitor(
+            config, {**webhooks, f"bot channel {self.channel_id}": self._post}
+        )
         self._channel = None
+        self._monitor_task = None
 
     # -- lifecycle -----------------------------------------------------------
 
     async def setup_hook(self):
-        self.check_versions.change_interval(seconds=self.interval)
-        self.check_versions.start()
+        self._monitor_task = asyncio.create_task(self._run_monitor())
         self.tree.add_command(self._versions_command())
         if self.guild_id:
             guild = discord.Object(id=int(self.guild_id))
@@ -88,6 +73,10 @@ class VersionMonitorBot(discord.Client):
     async def on_ready(self):
         log.info("Logged in as %s (id=%s)", self.user, self.user.id)
 
+    async def _run_monitor(self):
+        await self.wait_until_ready()
+        await self.monitor.run_forever()
+
     async def get_target_channel(self):
         if self._channel is None:
             self._channel = self.get_channel(self.channel_id) or await self.fetch_channel(
@@ -95,132 +84,9 @@ class VersionMonitorBot(discord.Client):
             )
         return self._channel
 
-    # -- monitoring loop -----------------------------------------------------
-
-    @tasks.loop(seconds=300)
-    async def check_versions(self):
-        # Cache GitHub results per cycle so a repo shared by several platforms
-        # (e.g. session-android backs both the Play and F-Droid checks) is only
-        # fetched once, keeping us under the unauthenticated 60 req/h limit.
-        github_cache = {}
-        for name, pcfg in self.platforms.items():
-            try:
-                await self._check_platform(name, pcfg, github_cache)
-            except Exception:  # keep the loop alive across per-platform errors
-                log.exception("Version check failed for platform %s", name)
-
-    @check_versions.before_loop
-    async def _before_loop(self):
-        await self.wait_until_ready()
-
-    async def _check_platform(self, name, pcfg, github_cache):
-        repo = pcfg["github_repo"]
-        github = github_cache.get(repo)
-        if github is None:
-            github = await asyncio.to_thread(
-                fetch_github_latest, repo, self.github_token
-            )
-            github_cache[repo] = github
-        store = await asyncio.to_thread(fetch_store, pcfg["store"])
-        log.info(
-            "%s: github=%s store=%s", name, github.version, store.version
-        )
-
-        prev = self.state.get(name)
-        result = evaluate(
-            prev, github.version, store.version, compare_versions,
-            strict_sync=bool(pcfg.get("strict_sync", False)),
-            now=time.time(),
-            reminder_interval=self.reminder_interval,
-        )
-        for event in result.events:
-            await self._announce(name, pcfg, event, github, store)
-        self.state.upsert(
-            name, github.version, store.version,
-            result.warning_active, result.last_warned_at, result.store_high,
-        )
-
-    # -- messaging -----------------------------------------------------------
-
-    async def _announce(self, name, pcfg, event, github, store):
-        display = pcfg.get("display_name", name)
-        store_name = STORE_DISPLAY_NAMES.get(pcfg["store"]["store"], "store")
+    async def _post(self, **message):
         channel = await self.get_target_channel()
-
-        content = ""
-        allowed = discord.AllowedMentions.none()
-        embed = discord.Embed()
-        embed.add_field(name=f"{store_name} version", value=event.store_version, inline=True)
-        embed.add_field(name="GitHub version", value=event.github_version, inline=True)
-        if store.url:
-            embed.add_field(name=f"{store_name} link", value=store.url, inline=False)
-        if github.url:
-            embed.add_field(name="GitHub release", value=github.url, inline=False)
-
-        if event.kind in (WARNING, WARNING_UPDATE, WARNING_REMINDER):
-            embed.color = COLOR_WARNING
-            ids = [int(uid) for uid in pcfg.get("tag_user_ids", [])]
-            content = " ".join(f"<@{uid}>" for uid in ids)
-            allowed = discord.AllowedMentions(users=[discord.Object(id=uid) for uid in ids])
-
-            # Direction-aware: the store may be ahead of GitHub or (for the APT
-            # repo, which must stay in sync) behind it.
-            if compare_versions(event.store_version, event.github_version) > 0:
-                direction = f"{store_name} is ahead of GitHub"
-                gap = (
-                    f"The {store_name} has published **{event.store_version}**, but the "
-                    f"latest GitHub release is only **{event.github_version}**."
-                )
-            else:
-                direction = f"{store_name} is behind GitHub"
-                gap = (
-                    f"GitHub has published **{event.github_version}**, but the "
-                    f"{store_name} is still at **{event.store_version}**."
-                )
-
-            if event.kind == WARNING:
-                first = " (first check)" if event.initial else ""
-                embed.title = f"⚠️ {display}: {direction}{first}"
-                embed.description = gap
-            elif event.kind == WARNING_UPDATE:
-                embed.title = f"⚠️ {display}: {direction} — divergence grew"
-                embed.description = gap
-            else:  # WARNING_REMINDER
-                hours = int(self.reminder_interval // 3600)
-                embed.title = f"⚠️ {display}: {direction} — still unresolved"
-                embed.description = f"{gap}\nStill out of sync after ~{hours}h."
-
-        elif event.kind == ALL_CLEAR:
-            embed.color = COLOR_ALL_CLEAR
-            embed.title = f"✅ {display}: resolved — back in sync"
-            embed.description = (
-                f"{store_name} and GitHub are back in sync at **{event.github_version}**."
-            )
-
-        elif event.kind == INFO_GITHUB:
-            embed.color = COLOR_INFO
-            embed.title = f"ℹ️ {display}: new GitHub release"
-            embed.description = (
-                f"GitHub advanced to **{event.github_version}** "
-                f"(the {store_name} is at **{event.store_version}**)."
-            )
-
-        elif event.kind == INFO_STORE:
-            embed.color = COLOR_INFO
-            embed.title = f"ℹ️ {display}: {store_name} updated"
-            embed.description = (
-                f"The {store_name} advanced to **{event.store_version}** "
-                f"(GitHub is at **{event.github_version}**)."
-            )
-        else:
-            log.warning("Unknown event kind: %s", event.kind)
-            return
-
-        await channel.send(content=content, embed=embed, allowed_mentions=allowed)
-        log.info(
-            "Posted %s for %s (store=%s github=%s)",
-            event.kind, name, event.store_version, event.github_version,
-        )
+        await channel.send(**message)
 
     # -- slash command -------------------------------------------------------
 
@@ -231,8 +97,8 @@ class VersionMonitorBot(discord.Client):
         )
         async def versions(interaction: discord.Interaction):
             lines = []
-            for name, pcfg in self.platforms.items():
-                st = self.state.get(name)
+            for name, pcfg in self.monitor.platforms.items():
+                st = self.monitor.state.get(name)
                 display = pcfg.get("display_name", name)
                 if st is None:
                     lines.append(f"**{display}**: no data yet")
@@ -248,6 +114,36 @@ class VersionMonitorBot(discord.Client):
             await interaction.response.send_message("\n".join(lines))
 
         return versions
+
+
+async def _open_webhooks(urls, session):
+    """Map a log label to each webhook's send coroutine."""
+    webhooks = {}
+    for url in urls:
+        webhook = discord.Webhook.from_url(url, session=session)
+        # The label must not contain the URL: its token is the posting secret.
+        label = f"webhook {webhook.id}"
+        # An unreachable webhook is kept rather than fatal: a webhook deleted in
+        # one server must not stop alerts to the others, and a network error
+        # here may be transient. Posting failures are logged per alert.
+        try:
+            info = await webhook.fetch()
+        except (discord.HTTPException, aiohttp.ClientError) as exc:
+            log.error("Can't reach %s (%s); will still try to post to it", label, exc)
+        else:
+            log.info("Posting to %s %r (channel id=%s)", label, info.name, info.channel_id)
+        webhooks[label] = webhook.send
+    return webhooks
+
+
+async def run(config, token, webhook_urls):
+    async with aiohttp.ClientSession() as session:
+        webhooks = await _open_webhooks(webhook_urls, session)
+        if token is None:
+            await Monitor(config, webhooks).run_forever()
+        else:
+            async with VersionMonitorBot(config, webhooks) as bot:
+                await bot.start(token)
 
 
 def main(argv=None):
@@ -273,50 +169,45 @@ def main(argv=None):
     config = load_config(args.config)
 
     if args.check_once:
-        _run_check_once(config)
+        asyncio.run(_run_check_once(config))
         return
 
-    token = config["discord"].get("token") or os.environ.get("DISCORD_BOT_TOKEN")
-    if not token:
-        sys.exit("No Discord bot token in config ('discord.token') or $DISCORD_BOT_TOKEN")
+    dcfg = config["discord"]
+    token = dcfg.get("token") or os.environ.get("DISCORD_BOT_TOKEN") or None
+    webhook_urls = dcfg.get("webhook_urls") or []
+    if token and not dcfg.get("channel_id"):
+        sys.exit("A bot token is configured but 'discord.channel_id' is not set")
+    if not token and not webhook_urls:
+        sys.exit(
+            "Nothing to post to: configure a bot token ('discord.token' or "
+            "$DISCORD_BOT_TOKEN) and/or 'discord.webhook_urls'"
+        )
+    try:
+        asyncio.run(run(config, token, webhook_urls))
+    except KeyboardInterrupt:
+        pass
 
-    bot = VersionMonitorBot(config)
-    bot.run(token, log_handler=None)
 
-
-def _run_check_once(config):
+async def _run_check_once(config):
     """Offline dry-run: fetch and evaluate every platform, print the events."""
-    store = StateStore(config.get("state_db", "divemo.db"))
-    github_token = config.get("github", {}).get("token") or None
-    reminder_interval = float(config.get("warning_reminder_hours", 12)) * 3600
-    github_cache = {}  # fetch each GitHub repo once even if shared by platforms
-    for name, pcfg in config["platforms"].items():
-        try:
-            repo = pcfg["github_repo"]
-            if repo not in github_cache:
-                github_cache[repo] = fetch_github_latest(repo, github_token)
-            github = github_cache[repo]
-            store_info = fetch_store(pcfg["store"])
-        except Exception as exc:  # noqa: BLE001 - report and continue
-            print(f"{name}: ERROR {exc}")
-            continue
-        prev = store.get(name)
-        result = evaluate(
-            prev, github.version, store_info.version, compare_versions,
-            strict_sync=bool(pcfg.get("strict_sync", False)),
-            now=time.time(),
-            reminder_interval=reminder_interval,
-        )
-        events = ", ".join(e.kind for e in result.events) or "none"
-        print(
-            f"{name}: github={github.version} store={store_info.version} "
-            f"warning_active={result.warning_active} events=[{events}]"
-        )
-        store.upsert(
-            name, github.version, store_info.version,
-            result.warning_active, result.last_warned_at, result.store_high,
-        )
-    store.close()
+    monitor = Monitor(config, targets={})
+    github_cache = {}
+    try:
+        for name, pcfg in monitor.platforms.items():
+            try:
+                github, store, result = await monitor.check_platform(
+                    name, pcfg, github_cache
+                )
+            except Exception as exc:  # noqa: BLE001 - report and continue
+                print(f"{name}: ERROR {exc}")
+                continue
+            events = ", ".join(e.kind for e in result.events) or "none"
+            print(
+                f"{name}: github={github.version} store={store.version} "
+                f"warning_active={result.warning_active} events=[{events}]"
+            )
+    finally:
+        monitor.state.close()
 
 
 if __name__ == "__main__":
